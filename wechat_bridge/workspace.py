@@ -43,14 +43,12 @@ def ensure_workspace(user_id: str) -> Path:
     workspace.mkdir(parents=True, exist_ok=True)
 
     claude_md = workspace / "CLAUDE.md"
-    if not claude_md.exists():
-        claude_md.write_text(_GUEST_CLAUDE_MD)
+    # Always overwrite — ensures template updates propagate to existing workspaces
+    claude_md.write_text(_GUEST_CLAUDE_MD)
+    if not (workspace / ".initialized").exists():
+        (workspace / ".initialized").touch()
         log.info("Created guest workspace: %s → %s", user_id[:16], workspace)
 
     return workspace
 
 
-def get_workspace(user_id: str) -> Path | None:
-    """Get workspace path if it exists, None otherwise."""
-    workspace = config.STATE_DIR / "workspaces" / _user_dir_name(user_id)
-    return workspace if workspace.exists() else None

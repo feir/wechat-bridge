@@ -48,15 +48,16 @@ def init() -> None:
     global STATE_DIR, FEISHU_NOTIFY_CHAT_ID, SYSTEM_PROMPT, MAX_BUDGET_USD, GUEST_MAX_BUDGET_USD
 
     raw = _require("WECHAT_ALLOWED_USERS")
-    ALLOWED_USERS = {u.strip() for u in raw.split(",") if u.strip()}
+    _users_ordered = [u.strip() for u in raw.split(",") if u.strip()]
+    ALLOWED_USERS = set(_users_ordered)
     if not ALLOWED_USERS:
         print("FATAL: WECHAT_ALLOWED_USERS is empty after parsing", file=sys.stderr)
         sys.exit(1)
 
-    # Primary user: explicit env var, or first in ALLOWED_USERS list
+    # Primary user: explicit env var, or first in the env var ordering (stable)
     PRIMARY_USER = os.environ.get("WECHAT_PRIMARY_USER", "").strip()
     if not PRIMARY_USER:
-        PRIMARY_USER = next(iter(ALLOWED_USERS))
+        PRIMARY_USER = _users_ordered[0]
 
     CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "sonnet").strip()
     CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
