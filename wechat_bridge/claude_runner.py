@@ -47,11 +47,20 @@ async def invoke(
     prompt: str,
     session_id: str | None = None,
     timeout: float | None = None,
+    cwd: str | None = None,
+    disallowed_tools: list[str] | None = None,
+    max_budget_usd: float | None = None,
 ) -> InvokeResult:
     """Run claude -p and return text + session_id.
 
     If session_id is None, starts a new session.
     If session_id is provided, resumes that session.
+
+    Guest-user parameters:
+      cwd: Working directory for the subprocess (workspace isolation).
+      disallowed_tools: Tools to block (e.g. Bash, Write, Edit).
+      max_budget_usd: Per-invocation cost cap (overrides global config).
+
     Returns InvokeResult with the response text and the actual session_id
     (which may differ from input on first call).
     """
@@ -69,8 +78,15 @@ async def invoke(
         cmd.extend(["--resume", session_id])
     if config.SYSTEM_PROMPT:
         cmd.extend(["--append-system-prompt", config.SYSTEM_PROMPT])
-    if config.MAX_BUDGET_USD > 0:
-        cmd.extend(["--max-budget-usd", str(config.MAX_BUDGET_USD)])
+
+    # Budget: per-invocation override > global config
+    budget = max_budget_usd if max_budget_usd is not None else config.MAX_BUDGET_USD
+    if budget > 0:
+        cmd.extend(["--max-budget-usd", str(budget)])
+
+    # Tool restrictions for guest users
+    if disallowed_tools:
+        cmd.extend(["--disallowed-tools", ",".join(disallowed_tools)])
 
     log.info("Claude invoke: session=%s prompt=%s...",
              (session_id or "new")[:8], prompt[:40])
@@ -81,6 +97,7 @@ async def invoke(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,  # isolate process group
+        cwd=cwd,  # None = inherit parent's cwd; set for guest workspace isolation
     )
 
     pgid = os.getpgid(proc.pid)

@@ -17,7 +17,7 @@ from typing import Any
 
 import aiohttp
 
-from . import config, ilink_api, claude_runner
+from . import config, ilink_api, claude_runner, workspace
 from .chunk import chunk_text
 from .ilink_api import ApiError
 from .ilink_types import WeixinMessage
@@ -174,11 +174,22 @@ async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> Non
         ticket = ""
 
     # Invoke Claude (under semaphore)
+    # Primary user: full permissions, no cwd isolation
+    # Guest user: restricted tools, workspace isolation, lower budget cap
+    is_primary = config.is_primary(user_id)
+    invoke_kwargs: dict[str, Any] = {}
+    if not is_primary:
+        ws = workspace.ensure_workspace(user_id)
+        invoke_kwargs["cwd"] = str(ws)
+        invoke_kwargs["disallowed_tools"] = config.GUEST_DISALLOWED_TOOLS
+        invoke_kwargs["max_budget_usd"] = config.GUEST_MAX_BUDGET_USD
+        log.info("Guest user %s → workspace %s", user_id[:16], ws)
+
     result: claude_runner.InvokeResult | None = None
     try:
         session_id = _session_map.get(user_id)  # None for new users
         async with _semaphore:
-            result = await claude_runner.invoke(text, session_id)
+            result = await claude_runner.invoke(text, session_id, **invoke_kwargs)
         reply = result.text
         # Store session_id from Claude response for future --resume
         if result.session_id:

@@ -17,15 +17,22 @@ def _require(name: str) -> str:
 
 # --- Required ---
 ALLOWED_USERS: set[str] = set()  # populated by init()
+PRIMARY_USER: str = ""  # primary user gets full permissions, no workspace isolation
 
 # --- Optional with defaults ---
 CLAUDE_MODEL: str = ""
 CLAUDE_TIMEOUT: int = 300
 MAX_CONCURRENT: int = 3
 MAX_BUDGET_USD: float = 0.0
+GUEST_MAX_BUDGET_USD: float = 1.0  # per-invocation cost cap for non-primary users
 STATE_DIR: Path = Path.home() / ".local" / "share" / "wechat-bridge"
 FEISHU_NOTIFY_CHAT_ID: str = ""
 SYSTEM_PROMPT: str = ""
+
+# Tools blocked for non-primary users (filesystem write + shell access)
+GUEST_DISALLOWED_TOOLS: list[str] = [
+    "Bash", "Write", "Edit", "NotebookEdit",
+]
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant in a WeChat conversation. "
@@ -37,8 +44,8 @@ _DEFAULT_SYSTEM_PROMPT = (
 
 def init() -> None:
     """Load config from environment. Call once at startup."""
-    global ALLOWED_USERS, CLAUDE_MODEL, CLAUDE_TIMEOUT, MAX_CONCURRENT, STATE_DIR
-    global FEISHU_NOTIFY_CHAT_ID, SYSTEM_PROMPT, MAX_BUDGET_USD
+    global ALLOWED_USERS, PRIMARY_USER, CLAUDE_MODEL, CLAUDE_TIMEOUT, MAX_CONCURRENT
+    global STATE_DIR, FEISHU_NOTIFY_CHAT_ID, SYSTEM_PROMPT, MAX_BUDGET_USD, GUEST_MAX_BUDGET_USD
 
     raw = _require("WECHAT_ALLOWED_USERS")
     ALLOWED_USERS = {u.strip() for u in raw.split(",") if u.strip()}
@@ -46,10 +53,16 @@ def init() -> None:
         print("FATAL: WECHAT_ALLOWED_USERS is empty after parsing", file=sys.stderr)
         sys.exit(1)
 
+    # Primary user: explicit env var, or first in ALLOWED_USERS list
+    PRIMARY_USER = os.environ.get("WECHAT_PRIMARY_USER", "").strip()
+    if not PRIMARY_USER:
+        PRIMARY_USER = next(iter(ALLOWED_USERS))
+
     CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "sonnet").strip()
     CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
     MAX_CONCURRENT = int(os.environ.get("WECHAT_MAX_CONCURRENT", "3"))
     MAX_BUDGET_USD = float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "0"))
+    GUEST_MAX_BUDGET_USD = float(os.environ.get("CLAUDE_GUEST_MAX_BUDGET_USD", "1.0"))
 
     state_dir = os.environ.get("WECHAT_STATE_DIR", "").strip()
     STATE_DIR = Path(state_dir) if state_dir else Path.home() / ".local" / "share" / "wechat-bridge"
@@ -57,3 +70,7 @@ def init() -> None:
 
     FEISHU_NOTIFY_CHAT_ID = os.environ.get("FEISHU_NOTIFY_CHAT_ID", "").strip()
     SYSTEM_PROMPT = os.environ.get("WECHAT_SYSTEM_PROMPT", "").strip() or _DEFAULT_SYSTEM_PROMPT
+
+
+def is_primary(user_id: str) -> bool:
+    return user_id == PRIMARY_USER
