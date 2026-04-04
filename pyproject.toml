@@ -1,0 +1,11 @@
+[project]
+name = "wechat-bridge"
+version = "0.1.0"
+description = "WeChat <-> Claude Code bridge via iLink Bot API"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9,<4",
+]
+
+[project.scripts]
+wechat-bridge = "wechat_bridge.__main__:main"

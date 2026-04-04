@@ -1,0 +1,20 @@
+[Unit]
+Description=WeChat <-> Claude Code Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+ExecStart=/home/opc/projects/wechat-bridge/scripts/wrapper.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wechat-bridge
+
+[Install]
+WantedBy=multi-user.target
