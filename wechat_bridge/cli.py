@@ -18,10 +18,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from . import config
 from .ilink_api import CHANNEL_VERSION
 from .ilink_types import MessageItemType, MessageState, MessageType
-
-CREDENTIALS_FILE = Path.home() / ".config" / "wechat-bridge" / "credentials.json"
 
 
 def _state_dir() -> Path:
@@ -30,11 +29,12 @@ def _state_dir() -> Path:
 
 
 def _load_credentials() -> dict[str, str]:
-    if not CREDENTIALS_FILE.exists():
-        print(f"Error: No credentials at {CREDENTIALS_FILE}", file=sys.stderr)
-        print("Run: python -m wechat_bridge.ilink_auth", file=sys.stderr)
+    creds_file = config.CREDENTIALS_FILE
+    if not creds_file.exists():
+        print(f"Error: No credentials at {creds_file}", file=sys.stderr)
+        print("Run: wechat-bridge --login", file=sys.stderr)
         sys.exit(1)
-    data = json.loads(CREDENTIALS_FILE.read_text())
+    data = json.loads(creds_file.read_text())
     if not data.get("bot_token") or not data.get("base_url"):
         print("Error: Invalid credentials (missing bot_token or base_url)", file=sys.stderr)
         sys.exit(1)

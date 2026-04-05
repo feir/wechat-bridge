@@ -28,6 +28,7 @@ GUEST_MAX_BUDGET_USD: float = 1.0  # per-invocation cost cap for non-primary use
 STATE_DIR: Path = Path.home() / ".local" / "share" / "wechat-bridge"
 FEISHU_NOTIFY_CHAT_ID: str = ""
 SYSTEM_PROMPT: str = ""
+CREDENTIALS_FILE: Path = Path.home() / ".config" / "wechat-bridge" / "credentials.json"
 
 # Tools blocked for non-primary users (filesystem write + shell access)
 GUEST_DISALLOWED_TOOLS: list[str] = [
@@ -46,6 +47,7 @@ def init() -> None:
     """Load config from environment. Call once at startup."""
     global ALLOWED_USERS, PRIMARY_USER, CLAUDE_MODEL, CLAUDE_TIMEOUT, MAX_CONCURRENT
     global STATE_DIR, FEISHU_NOTIFY_CHAT_ID, SYSTEM_PROMPT, MAX_BUDGET_USD, GUEST_MAX_BUDGET_USD
+    global CREDENTIALS_FILE
 
     raw = _require("WECHAT_ALLOWED_USERS")
     _users_ordered = [u.strip() for u in raw.split(",") if u.strip()]
@@ -69,8 +71,25 @@ def init() -> None:
     STATE_DIR = Path(state_dir) if state_dir else Path.home() / ".local" / "share" / "wechat-bridge"
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Credentials file: configurable for multi-instance deployments
+    creds_file = os.environ.get("WECHAT_CREDENTIALS_FILE", "").strip()
+    if creds_file:
+        CREDENTIALS_FILE = Path(creds_file)
+
     FEISHU_NOTIFY_CHAT_ID = os.environ.get("FEISHU_NOTIFY_CHAT_ID", "").strip()
-    SYSTEM_PROMPT = os.environ.get("WECHAT_SYSTEM_PROMPT", "").strip() or _DEFAULT_SYSTEM_PROMPT
+
+    # System prompt: file takes precedence over env var
+    prompt_file = os.environ.get("WECHAT_SYSTEM_PROMPT_FILE", "").strip()
+    if prompt_file:
+        p = Path(prompt_file)
+        if p.exists():
+            SYSTEM_PROMPT = p.read_text().strip()
+        else:
+            print(f"WARNING: WECHAT_SYSTEM_PROMPT_FILE={prompt_file} not found, using default",
+                  file=sys.stderr)
+            SYSTEM_PROMPT = _DEFAULT_SYSTEM_PROMPT
+    else:
+        SYSTEM_PROMPT = os.environ.get("WECHAT_SYSTEM_PROMPT", "").strip() or _DEFAULT_SYSTEM_PROMPT
 
 
 def is_primary(user_id: str) -> bool:

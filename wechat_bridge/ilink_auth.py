@@ -22,29 +22,33 @@ from pathlib import Path
 
 import aiohttp
 
-from . import ilink_api
+from . import config, ilink_api
 
 log = logging.getLogger(__name__)
 
-CREDENTIALS_DIR = Path.home() / ".config" / "wechat-bridge"
-CREDENTIALS_FILE = CREDENTIALS_DIR / "credentials.json"
+
+def _creds_path(path: Path | None = None) -> Path:
+    """Resolve credentials file path: explicit arg > config."""
+    return path if path is not None else config.CREDENTIALS_FILE
 
 
-def save_credentials(data: dict[str, str]) -> Path:
+def save_credentials(data: dict[str, str], path: Path | None = None) -> Path:
     """Persist credentials to disk."""
-    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
-    CREDENTIALS_FILE.write_text(json.dumps(data, indent=2))
-    CREDENTIALS_FILE.chmod(0o600)
-    log.info("Credentials saved to %s", CREDENTIALS_FILE)
-    return CREDENTIALS_FILE
+    target = _creds_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2))
+    target.chmod(0o600)
+    log.info("Credentials saved to %s", target)
+    return target
 
 
-def load_credentials() -> dict[str, str] | None:
+def load_credentials(path: Path | None = None) -> dict[str, str] | None:
     """Load credentials from disk, or None if absent/corrupt."""
-    if not CREDENTIALS_FILE.exists():
+    target = _creds_path(path)
+    if not target.exists():
         return None
     try:
-        data = json.loads(CREDENTIALS_FILE.read_text())
+        data = json.loads(target.read_text())
         if data.get("bot_token") and data.get("base_url"):
             return data
         return None
@@ -70,8 +74,9 @@ def _display_qr(qr_img_content: str) -> None:
         # Legacy: base64 PNG
         try:
             png_data = base64.b64decode(qr_img_content)
-            out = CREDENTIALS_DIR / "login_qr.png"
-            CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+            creds_dir = config.CREDENTIALS_FILE.parent
+            creds_dir.mkdir(parents=True, exist_ok=True)
+            out = creds_dir / "login_qr.png"
             out.write_bytes(png_data)
             print(f"\n  QR code saved to: {out}")
             print("  Open the file and scan with WeChat.\n")
@@ -79,7 +84,10 @@ def _display_qr(qr_img_content: str) -> None:
             print(f"  QR data: {qr_img_content[:80]}...")
 
 
-async def login(base_url: str = ilink_api.DEFAULT_BASE_URL) -> dict[str, str]:
+async def login(
+    base_url: str = ilink_api.DEFAULT_BASE_URL,
+    credentials_path: Path | None = None,
+) -> dict[str, str]:
     """Interactive QR login. Returns credentials dict."""
     async with aiohttp.ClientSession() as session:
         # Step 1: Get QR code
@@ -112,7 +120,7 @@ async def login(base_url: str = ilink_api.DEFAULT_BASE_URL) -> dict[str, str]:
                     "bot_id": status_resp.get("ilink_bot_id", ""),
                     "user_id": status_resp.get("ilink_user_id", ""),
                 }
-                save_credentials(creds)
+                save_credentials(creds, credentials_path)
                 print(f"  Login successful! Bot ID: {creds['bot_id']}")
                 return creds
             elif status == "expired":
@@ -126,11 +134,12 @@ async def login(base_url: str = ilink_api.DEFAULT_BASE_URL) -> dict[str, str]:
 
 async def _main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    creds = load_credentials()
+    target = config.CREDENTIALS_FILE
+    creds = load_credentials(target)
     if creds:
-        print(f"Existing credentials found (bot_id={creds.get('bot_id', '?')})")
+        print(f"Existing credentials found at {target} (bot_id={creds.get('bot_id', '?')})")
         print("Re-running login to refresh...")
-    await login()
+    await login(credentials_path=target)
 
 
 if __name__ == "__main__":

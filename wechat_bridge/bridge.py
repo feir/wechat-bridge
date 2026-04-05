@@ -636,11 +636,11 @@ async def run_bridge() -> None:
     config.init()
     log.info("Allowed users: %s", {u[:16] + "..." for u in config.ALLOWED_USERS})
 
-    # Load credentials
+    # Load credentials (path from config, supports multi-instance)
     from .ilink_auth import load_credentials
     creds = load_credentials()
     if not creds:
-        log.error("No credentials found. Run: python -m wechat_bridge.ilink_auth")
+        log.error("No credentials at %s. Run: wechat-bridge --login", config.CREDENTIALS_FILE)
         sys.exit(1)
 
     token = creds["bot_token"]

@@ -1,0 +1,27 @@
+[Unit]
+Description=WeChat <-> Claude Code Bridge (%i)
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=8
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wechat-bridge
+Restart=on-failure
+RestartSec=5
+
+# Environment: instance-specific .env.<instance-name>
+Environment=PATH=%h/.local/bin:%h/.local/share/claude/versions/current:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/wechat-bridge/.env.%i
+
+# Security hardening (aligned with non-template unit)
+MemoryMax=2G
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local %h/.config %h/.claude %h/projects /tmp
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wechat-bridge-%i
+
+[Install]
+WantedBy=default.target
