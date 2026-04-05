@@ -150,7 +150,16 @@ async def invoke(
                 cost_usd = evt.get("total_cost_usd", 0.0) or 0.0
                 if evt.get("is_error"):
                     errors = evt.get("errors", [])
-                    log.error("Claude error: %s", "; ".join(errors) if errors else "unknown")
+                    error_str = "; ".join(errors) if errors else "unknown"
+                    log.error("Claude error: %s", error_str)
+                    # Stale session: retry without --resume
+                    if session_id and "No conversation found" in error_str:
+                        log.info("Stale session %s, retrying without --resume", session_id[:8])
+                        return await invoke(
+                            prompt, session_id=None, timeout=timeout,
+                            cwd=cwd, disallowed_tools=disallowed_tools,
+                            max_budget_usd=max_budget_usd,
+                        )
                 else:
                     text = evt.get("result", "")
                     if text:
@@ -165,6 +174,10 @@ async def invoke(
             stderr_str = stderr_data.decode(errors="replace").strip()
             log.warning("Claude exit=%d stderr=%s", returncode, stderr_str[:300])
 
+    except asyncio.CancelledError:
+        log.info("Claude invoke cancelled, killing pgid %d", pgid)
+        _kill_pg(pgid)
+        raise
     except asyncio.TimeoutError:
         log.warning("Claude timeout after %ss, killing pgid %d", timeout, pgid)
         _kill_pg(pgid)

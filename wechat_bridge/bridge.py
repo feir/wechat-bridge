@@ -13,12 +13,14 @@ import logging
 import shutil
 import signal
 import sys
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 
-from . import config, ilink_api, claude_runner, workspace
+from . import cdn, commands, config, ilink_api, claude_runner, workspace
 from .chunk import chunk_text
+from .claude_runner import InvokeResult
 from .ilink_api import ApiError
 from .ilink_types import WeixinMessage
 from .session import ContextTokenStore, MessageDedup, SessionMap
@@ -39,6 +41,53 @@ _user_tasks: dict[str, asyncio.Task[None]] = {}
 _IDLE_COMPACT_DELAY = 50 * 60   # 50 min (10 min buffer before 1h cache TTL)
 _IDLE_COMPACT_MIN_CTX = 50_000  # Only compact sessions > 50K context tokens
 _compact_timers: dict[str, asyncio.TimerHandle] = {}  # user_id → timer handle
+_last_results: dict[str, InvokeResult] = {}  # user_id → last InvokeResult (for /status)
+
+
+# --- Text extraction & reply helpers ---
+
+def _extract_text(msg: WeixinMessage) -> str:
+    """Extract text from incoming WeChat message.
+
+    Supports: text items (type=1), voice ASR transcription (type=3 with text).
+    """
+    for item in msg.get("item_list", []):
+        itype = item.get("type")
+        if itype == 1 and "text_item" in item:
+            return item["text_item"]["text"]
+        # Voice with ASR transcription → treat as text (P0)
+        if itype == 3 and "voice_item" in item:
+            asr_text = item["voice_item"].get("text", "")
+            if asr_text:
+                return f"[语音转文字] {asr_text}"
+    return ""
+
+
+def _extract_images(msg: WeixinMessage) -> list[dict]:
+    """Extract image items from message for CDN download."""
+    images = []
+    for item in msg.get("item_list", []):
+        if item.get("type") == 2 and "image_item" in item:
+            images.append(item["image_item"])
+    return images
+
+
+async def _send_reply(
+    user_id: str, token: str, base_url: str, text: str,
+) -> None:
+    """Send text reply to user (chunked if needed). Best-effort."""
+    assert _http is not None
+    ctx = _ctx_store.get(user_id) or ""
+    if not ctx:
+        log.warning("No context_token for user %s, reply may fail", user_id[:16])
+    chunks = chunk_text(text)
+    for chunk in chunks:
+        try:
+            body = ilink_api.build_text_message(user_id, ctx, chunk)
+            await ilink_api.send_message(_http, base_url, token, body)
+        except Exception as e:
+            log.error("send_message failed: %s", e)
+            break
 
 
 # --- Idle auto-compact ---
@@ -119,83 +168,118 @@ async def _user_worker(user_id: str, token: str, base_url: str) -> None:
     """Process messages for a single user sequentially."""
     queue = _user_queues[user_id]
 
-    while not _shutdown:
-        try:
-            msg = await asyncio.wait_for(queue.get(), timeout=300)  # 5min idle
-        except asyncio.TimeoutError:
-            log.info("User worker idle timeout: %s", user_id[:16])
-            break
+    try:
+        while not _shutdown:
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=300)  # 5min idle
+            except asyncio.TimeoutError:
+                log.info("User worker idle timeout: %s", user_id[:16])
+                break
 
-        await _process_message(msg, token, base_url)
-        queue.task_done()
-
-    # Cleanup
-    _user_tasks.pop(user_id, None)
-    _user_queues.pop(user_id, None)
-    log.info("User worker exited: %s", user_id[:16])
+            await _process_message(msg, token, base_url)
+            queue.task_done()
+    finally:
+        # Cleanup — runs on normal exit, CancelledError (/stop, /new), or exception
+        _user_tasks.pop(user_id, None)
+        _user_queues.pop(user_id, None)
+        _last_results.pop(user_id, None)
+        log.info("User worker exited: %s", user_id[:16])
 
 
 async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> None:
-    """Process a single incoming message: permission → typing → Claude → reply."""
+    """Process a single incoming message: command check → media → typing → Claude → reply."""
     assert _http is not None
 
     user_id = msg["from_user_id"]
     context_token = msg["context_token"]
 
-    # Extract text
-    text = ""
-    for item in msg.get("item_list", []):
-        if item.get("type") == 1 and "text_item" in item:
-            text = item["text_item"]["text"]
-            break
+    # Extract text (includes voice ASR) and images
+    text = _extract_text(msg)
+    images = _extract_images(msg)
 
-    if not text:
+    if not text and not images:
         log.info("Non-text message from %s, skipping", user_id[:16])
         return
 
-    log.info("Processing: user=%s text=%s", user_id[:16], text[:40])
+    log.info("Processing: user=%s text=%s images=%d",
+             user_id[:16], (text or "(none)")[:40], len(images))
 
     # Update context token
     _ctx_store.update(user_id, context_token)
 
-    # Get typing ticket
+    # --- Bridge command handling (queued commands: /compact, /status, /help) ---
+    if text:
+        parsed = commands.parse_command(text)
+        if parsed:
+            cmd, arg = parsed
+            reply = await _handle_queued_command(cmd, arg, user_id)
+            await _send_reply(user_id, token, base_url, reply)
+            return
+
+    # --- Download, invoke, reply — unified try/finally for cleanup ---
+    image_paths: list[Path] = []
     typing_task: asyncio.Task[None] | None = None
-    try:
-        cfg = await ilink_api.get_config(_http, base_url, token, user_id, context_token)
-        ticket = cfg.get("typing_ticket", "")
-        if ticket:
-            # Start typing + refresh loop
-            await ilink_api.send_typing(_http, base_url, token, user_id, ticket, 1)
-            typing_task = asyncio.create_task(
-                _typing_refresh(user_id, ticket, token, base_url)
-            )
-    except Exception as e:
-        log.warning("get_config/typing failed: %s", e)
-        ticket = ""
+    ticket = ""
 
-    # Invoke Claude (under semaphore)
-    # Primary user: full permissions, no cwd isolation
-    # Guest user: restricted tools, workspace isolation, lower budget cap
-    is_primary = config.is_primary(user_id)
-    invoke_kwargs: dict[str, Any] = {}
-    if not is_primary:
-        ws = workspace.ensure_workspace(user_id)
-        invoke_kwargs["cwd"] = str(ws)
-        invoke_kwargs["disallowed_tools"] = config.GUEST_DISALLOWED_TOOLS
-        invoke_kwargs["max_budget_usd"] = config.GUEST_MAX_BUDGET_USD
-        log.info("Guest user %s → workspace %s", user_id[:16], ws)
-
-    result: claude_runner.InvokeResult | None = None
     try:
-        session_id = _session_map.get(user_id)  # None for new users
+        # Download images (before typing — download can be slow)
+        if images:
+            for img in images:
+                path = await cdn.download_image(_http, base_url, token, img)
+                if path:
+                    image_paths.append(path)
+            log.info("Downloaded %d/%d images for user %s",
+                     len(image_paths), len(images), user_id[:16])
+
+        # Build prompt: inject image paths so Claude can Read them
+        prompt = text or ""
+        if image_paths:
+            img_refs = "\n".join(str(p) for p in image_paths)
+            if prompt:
+                prompt = f"{prompt}\n\n[用户同时发送了图片，请用 Read 工具查看:]\n{img_refs}"
+            else:
+                prompt = f"[用户发送了图片，请用 Read 工具查看并描述:]\n{img_refs}"
+
+        if not prompt:
+            log.warning("No content to process for user %s", user_id[:16])
+            return
+
+        # Get typing ticket
+        try:
+            cfg = await ilink_api.get_config(_http, base_url, token, user_id, context_token)
+            ticket = cfg.get("typing_ticket", "")
+            if ticket:
+                await ilink_api.send_typing(_http, base_url, token, user_id, ticket, 1)
+                typing_task = asyncio.create_task(
+                    _typing_refresh(user_id, ticket, token, base_url)
+                )
+        except Exception as e:
+            log.warning("get_config/typing failed: %s", e)
+
+        # Invoke Claude (under semaphore)
+        is_primary = config.is_primary(user_id)
+        invoke_kwargs: dict[str, Any] = {}
+        if not is_primary:
+            ws = workspace.ensure_workspace(user_id)
+            invoke_kwargs["cwd"] = str(ws)
+            invoke_kwargs["disallowed_tools"] = config.GUEST_DISALLOWED_TOOLS
+            invoke_kwargs["max_budget_usd"] = config.GUEST_MAX_BUDGET_USD
+            log.info("Guest user %s → workspace %s", user_id[:16], ws)
+
+        session_id = _session_map.get(user_id)
         async with _semaphore:
-            result = await claude_runner.invoke(text, session_id, **invoke_kwargs)
+            result = await claude_runner.invoke(prompt, session_id, **invoke_kwargs)
         reply = result.text
-        # Store session_id from Claude response for future --resume
         if result.session_id:
             _session_map.set(user_id, result.session_id)
-        # Schedule idle compact if context is large enough
+        _last_results[user_id] = result
         _schedule_compact(user_id, result.session_id, result.total_context_tokens)
+        hint = commands.context_hint(result, config.CLAUDE_MODEL)
+        if hint:
+            reply = reply + "\n\n" + hint
+
+    except asyncio.CancelledError:
+        raise  # Let CancelledError propagate (cleanup in finally)
     except asyncio.TimeoutError:
         reply = "(Response timed out, please try again)"
     except Exception as e:
@@ -211,22 +295,40 @@ async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> Non
                 pass
         if ticket:
             await _stop_typing(user_id, ticket, token, base_url)
+        # Clean up temp image files (guaranteed even on CancelledError)
+        for p in image_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # Send reply (chunked if needed)
-    ctx = _ctx_store.get(user_id) or context_token
-    chunks = chunk_text(reply)
-    for chunk in chunks:
-        try:
-            body = ilink_api.build_text_message(user_id, ctx, chunk)
-            await ilink_api.send_message(_http, base_url, token, body)
-        except Exception as e:
-            log.error("send_message failed: %s", e)
-            break
+    await _send_reply(user_id, token, base_url, reply)
+    log.info("Reply sent: user=%s len=%d", user_id[:16], len(reply))
 
-    log.info("Reply sent: user=%s chunks=%d len=%d", user_id[:16], len(chunks), len(reply))
+
+async def _handle_queued_command(cmd: str, arg: str, user_id: str) -> str:
+    """Handle commands that are serialized with messages (/compact, /status, /help)."""
+    if cmd == "/compact":
+        session_id = _session_map.get(user_id)
+        if not session_id:
+            return "当前无活跃会话，无需压缩"
+        async with _semaphore:
+            return await commands.run_compact(session_id)
+    elif cmd == "/status":
+        session_id = _session_map.get(user_id)
+        last = _last_results.get(user_id)
+        return commands.format_status(last, session_id, config.CLAUDE_MODEL)
+    elif cmd == "/help":
+        return commands.format_help()
+    else:
+        return f"未知命令: {cmd}"
 
 
 # --- Main poll loop ---
+
+_SESSION_PAUSE_S = 60  # Pause before retry (transient -14 protection)
+
 
 async def _poll_loop(token: str, base_url: str) -> None:
     """Long-poll getupdates and dispatch to per-user workers."""
@@ -234,16 +336,35 @@ async def _poll_loop(token: str, base_url: str) -> None:
 
     buf = ""
     backoff = 0.0
+    session_retry_pending = False
 
     while not _shutdown:
         try:
             resp = await ilink_api.get_updates(_http, base_url, token, buf)
-            backoff = 0.0  # reset on success
+            backoff = 0.0
+            session_retry_pending = False
         except ApiError as e:
             if e.is_session_expired:
-                log.error("Session expired (errcode=-14)! Need to re-login.")
-                await _notify_session_expired()
-                return
+                if not session_retry_pending:
+                    # First -14: might be transient, pause and retry same token
+                    log.warning("Session expired (errcode=-14), pausing %ds before retry...",
+                                _SESSION_PAUSE_S)
+                    session_retry_pending = True
+                    await asyncio.sleep(_SESSION_PAUSE_S)
+                    continue
+                # Second -14: confirmed expiry, start recovery
+                log.error("Session expiry confirmed after retry. Starting recovery...")
+                result = await _session_recovery(base_url)
+                if result is None:
+                    return  # Shutdown or unrecoverable
+                token, base_url = result
+                buf = ""
+                session_retry_pending = False
+                # Safe: new workers only spawn in dispatch section below
+                # (after get_updates succeeds with new token). Existing workers
+                # hold old token by value and are cancelled here.
+                await _cancel_all_workers()
+                continue
             log.warning("getupdates error: %s (code=%s)", e, e.code)
             backoff = min(backoff + 2, 30)
             await asyncio.sleep(backoff)
@@ -277,6 +398,20 @@ async def _poll_loop(token: str, base_url: str) -> None:
                 log.info("Blocked message from non-allowed user: %s", user_id[:16])
                 continue
 
+            # Immediate commands (/stop, /new) bypass the queue
+            text = _extract_text(msg)
+            if text:
+                parsed = commands.parse_command(text)
+                if parsed and parsed[0] in ("/stop", "/new"):
+                    # Update context token even for immediate commands
+                    ctx_tok = msg.get("context_token", "")
+                    if ctx_tok:
+                        _ctx_store.update(user_id, ctx_tok)
+                    await _handle_immediate_command(
+                        parsed[0], user_id, token, base_url,
+                    )
+                    continue
+
             # Dispatch to per-user queue
             if user_id not in _user_queues:
                 _user_queues[user_id] = asyncio.Queue()
@@ -286,26 +421,192 @@ async def _poll_loop(token: str, base_url: str) -> None:
             await _user_queues[user_id].put(msg)
 
 
-async def _notify_session_expired() -> None:
-    """Notify via feishu-cli if available, otherwise just log."""
+async def _handle_immediate_command(
+    cmd: str, user_id: str, token: str, base_url: str,
+) -> None:
+    """Handle commands that bypass the queue (/stop, /new).
+
+    These must be processed immediately — if they were queued, they'd
+    block behind the very Claude invocation the user wants to cancel.
+    """
+    if cmd == "/stop":
+        task = _user_tasks.get(user_id)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            # Defensive cleanup (worker finally should handle this, but be safe)
+            _user_tasks.pop(user_id, None)
+            _user_queues.pop(user_id, None)
+            log.info("User task cancelled via /stop: %s", user_id[:16])
+            await _send_reply(user_id, token, base_url, "已停止当前任务")
+        else:
+            await _send_reply(user_id, token, base_url, "当前没有运行中的任务")
+
+    elif cmd == "/new":
+        # Cancel running task if any
+        task = _user_tasks.get(user_id)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            _user_tasks.pop(user_id, None)
+            _user_queues.pop(user_id, None)
+            log.info("User task cancelled via /new: %s", user_id[:16])
+        # Reset session
+        _session_map.reset(user_id)
+        _session_map.flush()
+        _last_results.pop(user_id, None)
+        # Cancel idle compact timer
+        timer = _compact_timers.pop(user_id, None)
+        if timer:
+            timer.cancel()
+        log.info("Session reset via /new: %s", user_id[:16])
+        await _send_reply(user_id, token, base_url, "会话已重置，开始新对话")
+
+
+_RECOVERY_MAX_ERRORS = 10  # Max consecutive non-transient errors before giving up
+
+
+async def _session_recovery(base_url: str) -> tuple[str, str] | None:
+    """Recover session via QR re-login with Feishu notifications.
+
+    Flow:
+        1. Notify Feishu "系统监测" group
+        2. Generate QR → push URL to Feishu → poll for scan
+        3. On confirmed: save credentials, clear stale state, return new (token, base_url)
+        4. On QR expired: generate new QR and repeat
+    Returns None on shutdown or unrecoverable error.
+
+    Security: QR URL is sent to FEISHU_NOTIFY_CHAT_ID. Ensure this chat
+    is restricted to authorized operators — anyone who can see the QR can
+    hijack the WeChat session (valid ~5 min).
+    """
+    assert _http is not None
+    from .ilink_auth import save_credentials
+
+    await _notify_feishu(
+        "[wechat-bridge] Session expired (errcode=-14)\n"
+        "Initiating QR re-login. Generating QR code..."
+    )
+
+    error_count = 0
+
+    while not _shutdown:
+        try:
+            qr_resp = await ilink_api.fetch_qr_code(_http, base_url)
+            qr_url = qr_resp.get("qrcode_img_content", "")
+            qr_id = qr_resp["qrcode"]
+            error_count = 0  # QR fetch succeeded, reset error counter
+
+            # Push QR URL to Feishu for easy mobile scanning
+            await _notify_feishu(
+                "[wechat-bridge] Scan to re-login:\n"
+                f"{qr_url}\n\n"
+                "QR expires in ~5 min. Waiting..."
+            )
+            log.info("QR code pushed to Feishu, waiting for scan...")
+
+            # Poll scan status
+            while not _shutdown:
+                status_resp = await ilink_api.poll_qr_status(_http, base_url, qr_id)
+                status = status_resp["status"]
+
+                if status == "confirmed":
+                    new_creds = {
+                        "bot_token": status_resp["bot_token"],
+                        "base_url": status_resp.get("baseurl", base_url),
+                        "bot_id": status_resp.get("ilink_bot_id", ""),
+                        "user_id": status_resp.get("ilink_user_id", ""),
+                    }
+                    save_credentials(new_creds)
+                    # Context tokens invalidated by new iLink session.
+                    # _session_map (Claude sessions) deliberately NOT cleared —
+                    # Claude sessions are independent of iLink and can resume.
+                    _ctx_store.clear()
+                    _ctx_store.flush()
+                    await _notify_feishu(
+                        "[wechat-bridge] Re-login successful! Bot resumed.\n"
+                        f"bot_id={new_creds['bot_id']}"
+                    )
+                    log.info("Session recovery complete, new token obtained")
+                    return new_creds["bot_token"], new_creds["base_url"]
+
+                elif status == "scaned":
+                    log.info("QR scanned, waiting for confirmation...")
+
+                elif status == "expired":
+                    log.info("QR expired, generating new one...")
+                    await _notify_feishu(
+                        "[wechat-bridge] QR code expired. Generating new one..."
+                    )
+                    break  # Break inner loop → generate new QR
+
+                await asyncio.sleep(2)
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # Transient network error — retry without counting
+            log.warning("Session recovery transient error: %s", e)
+            await asyncio.sleep(30)
+        except Exception as e:
+            # Contract/API error — count towards limit
+            error_count += 1
+            log.error("Session recovery error (%d/%d): %s",
+                      error_count, _RECOVERY_MAX_ERRORS, e)
+            if error_count >= _RECOVERY_MAX_ERRORS:
+                await _notify_feishu(
+                    f"[wechat-bridge] Session recovery FAILED after {error_count} errors.\n"
+                    f"Last error: {e}\n"
+                    "Bridge stopping. Manual intervention required."
+                )
+                return None
+            await asyncio.sleep(30)
+
+    return None
+
+
+async def _cancel_all_workers() -> None:
+    """Cancel all user workers (they hold stale token references)."""
+    for task in _user_tasks.values():
+        task.cancel()
+    if _user_tasks:
+        await asyncio.gather(*_user_tasks.values(), return_exceptions=True)
+    _user_tasks.clear()
+    _user_queues.clear()
+    for handle in _compact_timers.values():
+        handle.cancel()
+    _compact_timers.clear()
+    log.info("All user workers cancelled (session reset)")
+
+
+async def _notify_feishu(text: str) -> None:
+    """Send notification to Feishu 系统监测 group. Best-effort, never raises."""
     chat_id = config.FEISHU_NOTIFY_CHAT_ID
     if not chat_id:
-        log.warning("No FEISHU_NOTIFY_CHAT_ID set, cannot send session expiry notification")
+        log.warning("No FEISHU_NOTIFY_CHAT_ID set, skipping notification")
         return
 
-    if not shutil.which("feishu-cli"):
-        log.warning("feishu-cli not found, cannot send notification")
+    cli = shutil.which("feishu-cli")
+    if not cli:
+        log.warning("feishu-cli not found, skipping notification")
         return
 
-    proc = await asyncio.create_subprocess_exec(
-        "feishu-cli", "send-message",
-        "--chat-id", chat_id,
-        "--text", "[wechat-bridge] Session expired! Please re-scan QR code.",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await proc.wait()
-    log.info("Session expiry notification sent to feishu chat %s", chat_id)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, "send-message", "--chat-id", chat_id, "--text", text,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        if proc.returncode != 0:
+            stderr = (await proc.stderr.read()).decode()[:200] if proc.stderr else ""
+            log.warning("feishu-cli failed (rc=%d): %s", proc.returncode, stderr)
+    except Exception as e:
+        log.warning("Failed to send feishu notification: %s", e)
 
 
 # --- Shutdown ---

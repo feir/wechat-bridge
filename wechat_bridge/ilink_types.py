@@ -43,13 +43,15 @@ class TextItem(TypedDict):
 
 
 class CDNMedia(TypedDict):
-    encrypt_query_param: str
-    aes_key: str
+    encrypt_query_param: NotRequired[str]
+    aes_key: NotRequired[str]
     encrypt_type: NotRequired[int]
+    full_url: NotRequired[str]
 
 
 class ImageItem(TypedDict):
     media: CDNMedia
+    aeskey: NotRequired[str]  # hex-encoded AES key (preferred over media.aes_key)
     url: NotRequired[str]
 
 

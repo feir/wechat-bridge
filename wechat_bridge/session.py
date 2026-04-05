@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-import uuid
 from collections import OrderedDict
 from pathlib import Path
 
@@ -79,6 +78,10 @@ class ContextTokenStore:
 
     def get(self, user_id: str) -> str | None:
         return self._tokens.get(user_id)
+
+    def clear(self) -> None:
+        """Clear all tokens (e.g. after session re-login)."""
+        self._tokens.clear()
 
 
 # --- 2.4 Session Map ---
