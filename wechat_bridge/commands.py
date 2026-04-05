@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 # --- Command detection ---
 
-_COMMANDS = frozenset({"/new", "/stop", "/compact", "/status", "/help"})
+_COMMANDS = frozenset({"/new", "/stop", "/compact", "/status", "/update", "/help"})
 
 
 def parse_command(text: str) -> tuple[str, str] | None:
@@ -41,6 +41,7 @@ def format_help() -> str:
         "/stop — 停止当前任务\n"
         "/compact — 压缩上下文\n"
         "/status — 查看会话状态\n"
+        "/update — 检查并拉取新版本\n"
         "/help — 显示此帮助"
     )
 
@@ -109,22 +110,63 @@ async def run_compact(session_id: str, timeout: float = 120) -> str:
         return f"压缩失败: {e}"
 
 
-# --- Context hint (appended to normal replies) ---
+# --- /update command ---
 
-def context_hint(result: InvokeResult, model: str) -> str | None:
-    """Build context usage hint for reply suffix. Returns None if under threshold."""
+async def run_update() -> str:
+    """Execute /update — check for new version and pull if available.
+
+    Runs check_and_update() in a thread executor to avoid blocking the
+    event loop (subprocess.run inside can take up to 120s for pipx).
+    """
+    from wechat_bridge import __version__
+    from . import updater
+
+    pv = updater.get_pending_version()
+    if pv:
+        return f"v{pv} 已就绪（当前运行 v{__version__}），重启服务部署。"
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, updater.check_and_update)
+    status = result.get("status")
+    if status == "updated":
+        return (
+            f"已拉取新版本 v{result['version']}"
+            f"（当前运行 v{__version__}），重启服务部署。"
+        )
+    elif status == "up_to_date":
+        return f"已是最新版本 v{__version__}。"
+    else:
+        return f"检查更新失败: {result.get('message', '未知错误')}"
+
+
+# --- Reply suffix (context hint + update banner) ---
+
+def reply_suffix(result: InvokeResult, model: str) -> str | None:
+    """Build combined reply suffix: context hint + update banner.
+
+    Returns None if nothing to append.
+    """
+    parts: list[str] = []
+
+    # Context usage hint
     max_ctx = _context_window_for_model(model)
     total_ctx = result.total_context_tokens
-    if max_ctx == 0 or total_ctx == 0:
+    if max_ctx > 0 and total_ctx > 0:
+        pct = total_ctx / max_ctx * 100
+        if pct >= 85:
+            parts.append(f"⚠ Context {pct:.0f}% — 建议 /new 新会话或 /compact 压缩")
+        elif pct >= 70:
+            parts.append(f"💡 Context {pct:.0f}% — 可考虑 /compact 压缩上下文")
+
+    # Update banner
+    from . import updater
+    banner = updater.get_update_banner()
+    if banner:
+        parts.append(banner)
+
+    if not parts:
         return None
-
-    pct = total_ctx / max_ctx * 100
-
-    if pct >= 85:
-        return f"---\n⚠ Context {pct:.0f}% — 建议 /new 新会话或 /compact 压缩"
-    if pct >= 70:
-        return f"---\n💡 Context {pct:.0f}% — 可考虑 /compact 压缩上下文"
-    return None
+    return "---\n" + "\n".join(parts)
 
 
 # --- Model context windows ---

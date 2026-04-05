@@ -274,9 +274,9 @@ async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> Non
             _session_map.set(user_id, result.session_id)
         _last_results[user_id] = result
         _schedule_compact(user_id, result.session_id, result.total_context_tokens)
-        hint = commands.context_hint(result, config.CLAUDE_MODEL)
-        if hint:
-            reply = reply + "\n\n" + hint
+        suffix = commands.reply_suffix(result, config.CLAUDE_MODEL)
+        if suffix:
+            reply = reply + "\n\n" + suffix
 
     except asyncio.CancelledError:
         raise  # Let CancelledError propagate (cleanup in finally)
@@ -319,6 +319,8 @@ async def _handle_queued_command(cmd: str, arg: str, user_id: str) -> str:
         session_id = _session_map.get(user_id)
         last = _last_results.get(user_id)
         return commands.format_status(last, session_id, config.CLAUDE_MODEL)
+    elif cmd == "/update":
+        return await commands.run_update()
     elif cmd == "/help":
         return commands.format_help()
     else:
@@ -649,6 +651,11 @@ async def run_bridge() -> None:
     _ctx_store = ContextTokenStore(config.STATE_DIR)
     _session_map = SessionMap(config.STATE_DIR)
     _semaphore = asyncio.Semaphore(config.MAX_CONCURRENT)
+
+    # Start background update checker
+    from .updater import get_install_info, init_updater
+    _mode, _src_path = get_install_info()
+    init_updater(_mode, _src_path)
 
     # Signal handlers
     loop = asyncio.get_running_loop()
