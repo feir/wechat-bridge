@@ -28,8 +28,13 @@ def _state_dir() -> Path:
     return Path(env) if env else Path.home() / ".local" / "share" / "wechat-bridge"
 
 
+def _creds_path() -> Path:
+    env = os.environ.get("WECHAT_CREDENTIALS_FILE", "").strip()
+    return Path(env) if env else config.CREDENTIALS_FILE
+
+
 def _load_credentials() -> dict[str, str]:
-    creds_file = config.CREDENTIALS_FILE
+    creds_file = _creds_path()
     if not creds_file.exists():
         print(f"Error: No credentials at {creds_file}", file=sys.stderr)
         print("Run: wechat-bridge --login", file=sys.stderr)
