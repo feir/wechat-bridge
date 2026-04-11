@@ -1,3 +1,3 @@
 """WeChat <-> Claude Code bridge via iLink Bot API."""
 
-__version__ = "2026.4.11"
+__version__ = "2026.4.11.1"

@@ -23,8 +23,8 @@ else
   NEW="$TODAY"
 fi
 
-# Update both sources of truth
-sed -i "s/^__version__ = .*/__version__ = \"$NEW\"/" "$INIT_FILE"
-sed -i "s/^version = .*/version = \"$NEW\"/" "$TOML_FILE"
+# Update both sources of truth (sed -i '' for macOS BSD sed compatibility)
+sed -i '' "s/^__version__ = .*/__version__ = \"$NEW\"/" "$INIT_FILE"
+sed -i '' "s/^version = .*/version = \"$NEW\"/" "$TOML_FILE"
 
 echo "$NEW"
