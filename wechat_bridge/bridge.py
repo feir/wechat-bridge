@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re as _re
 import shutil
 import signal
 import sys
@@ -18,8 +19,9 @@ from typing import Any
 
 import aiohttp
 
-from . import cdn, commands, config, ilink_api, claude_runner, workspace
+from . import cdn, commands, config, ilink_api, claude_runner, lockfile, workspace
 from .chunk import chunk_text
+from .format import md_to_wechat
 from .claude_runner import InvokeResult
 from .ilink_api import ApiError
 from .ilink_types import WeixinMessage
@@ -30,6 +32,7 @@ log = logging.getLogger(__name__)
 # --- Globals (initialized in run_bridge) ---
 _shutdown = False
 _http: aiohttp.ClientSession | None = None
+_bot_id: str = ""  # iLink bot user ID, for @mention detection in groups
 _dedup: MessageDedup
 _ctx_store: ContextTokenStore
 _session_map: SessionMap
@@ -45,6 +48,72 @@ _last_results: dict[str, InvokeResult] = {}  # user_id → last InvokeResult (fo
 
 
 # --- Text extraction & reply helpers ---
+
+def _detect_group(msg: WeixinMessage) -> str | None:
+    """Detect if message is from a group chat.
+
+    Returns group_id (room_id / chat_room_id) if group message, None if DM.
+    iLink uses room_id or chat_room_id fields, and group IDs end with @chatroom.
+    """
+    room_id = str(msg.get("room_id", "") or msg.get("chat_room_id", "") or "").strip()  # type: ignore[call-overload]
+    if room_id:
+        return room_id
+    # Heuristic: to_user_id ending in @chatroom
+    to_user = str(msg.get("to_user_id", "")).strip()
+    if to_user.endswith("@chatroom"):
+        return to_user
+    return None
+
+
+def _is_group_allowed(group_id: str) -> bool:
+    """Check if a group message should be processed based on GROUP_POLICY."""
+    if config.GROUP_POLICY == "disabled":
+        return False
+    if config.GROUP_POLICY == "open":
+        return True
+    if config.GROUP_POLICY == "allowlist":
+        return group_id in config.ALLOWED_GROUPS
+    return False
+
+
+def _has_mention(msg: WeixinMessage, text: str) -> bool:
+    """Check if message contains an @mention of our bot specifically.
+
+    Only returns True if the bot's ID appears in at_user_list or if
+    to_user_id matches the bot (direct reply to bot in group).
+    Falls back to checking if message's to_user_id is the bot (some
+    iLink versions route @mentions this way).
+    """
+    # Check at_user_list for bot-specific mention
+    at_list = msg.get("at_user_list", [])  # type: ignore[call-overload]
+    if at_list and _bot_id:
+        if _bot_id in at_list:
+            return True
+        # at_list exists but bot not in it → not our mention
+        return False
+    if at_list:
+        # No bot_id to compare — conservatively accept
+        return True
+
+    # Some iLink versions set to_user_id to the mentioned user
+    to_user = str(msg.get("to_user_id", "")).strip()
+    if _bot_id and to_user == _bot_id:
+        return True
+
+    return False
+
+
+_MENTION_RE = _re.compile(r"@\S+\s*")
+
+
+def _strip_mention(text: str) -> str:
+    """Remove @mention prefix from group message text.
+
+    Users typically send '@bot /stop' in groups. Strip the mention
+    so command parsing and Claude prompt are clean.
+    """
+    return _MENTION_RE.sub("", text, count=1).strip()
+
 
 def _extract_text(msg: WeixinMessage) -> str:
     """Extract text from incoming WeChat message.
@@ -72,14 +141,126 @@ def _extract_images(msg: WeixinMessage) -> list[dict]:
     return images
 
 
+def _extract_files(msg: WeixinMessage) -> list[tuple[dict, str]]:
+    """Extract file items (type=4) from message. Returns [(media_dict, filename), ...]."""
+    files = []
+    for item in msg.get("item_list", []):
+        if item.get("type") == 4 and "file_item" in item:
+            fi = item["file_item"]
+            # Sanitize to basename to prevent path traversal from untrusted input
+            fname = Path(fi.get("file_name", "")).name
+            files.append((fi.get("media", {}), fname))
+    return files
+
+
+def _extract_videos(msg: WeixinMessage) -> list[dict]:
+    """Extract video items (type=5) from message. Returns [media_dict, ...]."""
+    videos = []
+    for item in msg.get("item_list", []):
+        if item.get("type") == 5 and "video_item" in item:
+            videos.append(item["video_item"].get("media", {}))
+    return videos
+
+
+def _extract_quoted_media(msg: WeixinMessage) -> tuple[str, list[dict], list[tuple[dict, str]], list[dict]]:
+    """Extract text and media from quoted/reply messages.
+
+    iLink includes quoted message content in item_list entries with a
+    'reply_item' or 'quote_item' wrapper, which contains its own item_list.
+    Also checks top-level 'reply' and 'quote' fields on the message.
+
+    Returns: (quoted_text, images, files, videos) from the quoted message.
+    """
+    quoted_text = ""
+    images: list[dict] = []
+    files: list[tuple[dict, str]] = []
+    videos: list[dict] = []
+
+    # Check all possible quote locations in iLink protocol
+    quote_sources: list[dict] = []
+
+    # Top-level reply/quote fields
+    for key in ("reply", "quote", "reply_item", "quote_item"):
+        q = msg.get(key)  # type: ignore[call-overload]
+        if isinstance(q, dict):
+            quote_sources.append(q)
+
+    # Item-level reply wrappers
+    for item in msg.get("item_list", []):
+        for key in ("reply_item", "quote_item"):
+            q = item.get(key)
+            if isinstance(q, dict):
+                quote_sources.append(q)
+
+    for source in quote_sources:
+        for qitem in source.get("item_list", []):
+            qtype = qitem.get("type")
+            if qtype == 1 and "text_item" in qitem:
+                qt = qitem["text_item"].get("text", "")
+                if qt and not quoted_text:
+                    quoted_text = qt
+            elif qtype == 2 and "image_item" in qitem:
+                images.append(qitem["image_item"])
+            elif qtype == 4 and "file_item" in qitem:
+                fi = qitem["file_item"]
+                files.append((fi.get("media", {}), Path(fi.get("file_name", "")).name))
+            elif qtype == 5 and "video_item" in qitem:
+                videos.append(qitem["video_item"].get("media", {}))
+
+        # Some formats have direct media fields
+        if "image_item" in source:
+            images.append(source["image_item"])
+        if "media" in source and source.get("type") in (2, 4, 5):
+            # Flat format: media directly on quote
+            if source.get("type") == 2:
+                images.append({"media": source["media"]})
+            elif source.get("type") == 4:
+                files.append((source["media"], Path(source.get("file_name", "")).name))
+            elif source.get("type") == 5:
+                videos.append(source["media"])
+
+    return quoted_text, images, files, videos
+
+
+async def _send_media(
+    user_id: str, token: str, base_url: str, file_path: Path,
+) -> bool:
+    """Upload and send a media file (image/file) to user. Returns True on success.
+
+    Currently unused — intended for sending Claude-generated files (plots, exports)
+    back to the user. Will be wired into Claude tool output handling.
+    """
+    assert _http is not None
+    ctx = _ctx_store.get(user_id) or ""
+
+    upload_info = await cdn.upload_media(_http, base_url, token, file_path)
+    if not upload_info:
+        return False
+
+    suffix = file_path.suffix.lower()
+    if suffix in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+        body = ilink_api.build_image_message(user_id, ctx, upload_info)
+    else:
+        body = ilink_api.build_file_message(user_id, ctx, upload_info, file_path.name)
+
+    try:
+        await ilink_api.send_message(_http, base_url, token, body)
+        log.info("Media sent to user %s: %s", user_id[:16], file_path.name)
+        return True
+    except Exception as e:
+        log.error("send_message (media) failed: %s", e)
+        return False
+
+
 async def _send_reply(
     user_id: str, token: str, base_url: str, text: str,
 ) -> None:
-    """Send text reply to user (chunked if needed). Best-effort."""
+    """Send text reply to user (format-adapted, chunked if needed). Best-effort."""
     assert _http is not None
     ctx = _ctx_store.get(user_id) or ""
     if not ctx:
         log.warning("No context_token for user %s, reply may fail", user_id[:16])
+    text = md_to_wechat(text)
     chunks = chunk_text(text)
     for chunk in chunks:
         try:
@@ -190,55 +371,97 @@ async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> Non
     """Process a single incoming message: command check → media → typing → Claude → reply."""
     assert _http is not None
 
-    user_id = msg["from_user_id"]
+    sender_id = msg["from_user_id"]
     context_token = msg["context_token"]
+    group_id = _detect_group(msg)
+    # Reply target: group_id for group messages, sender_id for DMs
+    reply_to = group_id or sender_id
+    # Session key: same as reply_to (group shares one Claude session)
+    user_id = reply_to
 
-    # Extract text (includes voice ASR) and images
+    # Extract text (includes voice ASR) and media
     text = _extract_text(msg)
     images = _extract_images(msg)
+    files = _extract_files(msg)
+    videos = _extract_videos(msg)
 
-    if not text and not images:
+    # Strip @mention prefix for group messages so commands and Claude prompt are clean
+    if group_id and text:
+        text = _strip_mention(text)
+
+    # Extract quoted/reply message media (user long-pressing a message to reply)
+    quoted_text, q_images, q_files, q_videos = _extract_quoted_media(msg)
+    images.extend(q_images)
+    files.extend(q_files)
+    videos.extend(q_videos)
+
+    if not text and not images and not files and not videos:
         log.info("Non-text message from %s, skipping", user_id[:16])
         return
 
-    log.info("Processing: user=%s text=%s images=%d",
-             user_id[:16], (text or "(none)")[:40], len(images))
+    # Prepend quoted text context if user is replying to a message
+    if quoted_text and text:
+        text = f"[引用消息: {quoted_text[:200]}]\n\n{text}"
 
-    # Update context token
-    _ctx_store.update(user_id, context_token)
+    log.info("Processing: user=%s text=%s images=%d files=%d videos=%d",
+             user_id[:16], (text or "(none)")[:40], len(images), len(files), len(videos))
+
+    # Update context token (keyed by reply target so send_reply can find it)
+    _ctx_store.update(reply_to, context_token)
 
     # --- Bridge command handling (queued commands: /compact, /status, /help) ---
     if text:
         parsed = commands.parse_command(text)
         if parsed:
             cmd, arg = parsed
-            reply = await _handle_queued_command(cmd, arg, user_id)
+            reply = await _handle_queued_command(cmd, arg, user_id, sender_id)
             await _send_reply(user_id, token, base_url, reply)
             return
 
     # --- Download, invoke, reply — unified try/finally for cleanup ---
-    image_paths: list[Path] = []
+    media_paths: list[Path] = []  # all downloaded media (images, files, videos)
     typing_task: asyncio.Task[None] | None = None
     ticket = ""
 
     try:
-        # Download images (before typing — download can be slow)
+        # Download media (before typing — download can be slow)
         if images:
             for img in images:
                 path = await cdn.download_image(_http, base_url, token, img)
                 if path:
-                    image_paths.append(path)
+                    media_paths.append(path)
             log.info("Downloaded %d/%d images for user %s",
-                     len(image_paths), len(images), user_id[:16])
+                     len(media_paths), len(images), user_id[:16])
 
-        # Build prompt: inject image paths so Claude can Read them
+        if files:
+            for media_dict, fname in files:
+                path = await cdn.download_media(
+                    _http, base_url, token, media_dict, file_name=fname,
+                )
+                if path:
+                    media_paths.append(path)
+            log.info("Downloaded %d/%d files for user %s",
+                     sum(1 for _ in files), len(files), user_id[:16])
+
+        if videos:
+            for media_dict in videos:
+                path = await cdn.download_media(
+                    _http, base_url, token, media_dict, suffix=".mp4",
+                )
+                if path:
+                    media_paths.append(path)
+            log.info("Downloaded %d/%d videos for user %s",
+                     sum(1 for _ in videos), len(videos), user_id[:16])
+
+        # Build prompt: inject media paths so Claude can Read them
         prompt = text or ""
-        if image_paths:
-            img_refs = "\n".join(str(p) for p in image_paths)
+        if media_paths:
+            media_refs = "\n".join(str(p) for p in media_paths)
+            label = "图片" if images and not files and not videos else "文件"
             if prompt:
-                prompt = f"{prompt}\n\n[用户同时发送了图片，请用 Read 工具查看:]\n{img_refs}"
+                prompt = f"{prompt}\n\n[用户同时发送了{label}，请用 Read 工具查看:]\n{media_refs}"
             else:
-                prompt = f"[用户发送了图片，请用 Read 工具查看并描述:]\n{img_refs}"
+                prompt = f"[用户发送了{label}，请用 Read 工具查看并描述:]\n{media_refs}"
 
         if not prompt:
             log.warning("No content to process for user %s", user_id[:16])
@@ -257,7 +480,8 @@ async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> Non
             log.warning("get_config/typing failed: %s", e)
 
         # Invoke Claude (under semaphore)
-        is_primary = config.is_primary(user_id)
+        # Use sender_id for privilege check — user_id is group_id for groups
+        is_primary = config.is_primary(sender_id)
         invoke_kwargs: dict[str, Any] = {}
         if not is_primary:
             ws = workspace.ensure_workspace(user_id)
@@ -295,8 +519,8 @@ async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> Non
                 pass
         if ticket:
             await _stop_typing(user_id, ticket, token, base_url)
-        # Clean up temp image files (guaranteed even on CancelledError)
-        for p in image_paths:
+        # Clean up temp media files (guaranteed even on CancelledError)
+        for p in media_paths:
             try:
                 p.unlink(missing_ok=True)
             except OSError:
@@ -307,8 +531,11 @@ async def _process_message(msg: WeixinMessage, token: str, base_url: str) -> Non
     log.info("Reply sent: user=%s len=%d", user_id[:16], len(reply))
 
 
-async def _handle_queued_command(cmd: str, arg: str, user_id: str) -> str:
-    """Handle commands that are serialized with messages (/compact, /status, /help)."""
+async def _handle_queued_command(cmd: str, arg: str, user_id: str, sender_id: str) -> str:
+    """Handle commands that are serialized with messages (/compact, /status, /help).
+
+    sender_id is the actual human who sent the command (differs from user_id in groups).
+    """
     if cmd == "/compact":
         session_id = _session_map.get(user_id)
         if not session_id:
@@ -320,6 +547,8 @@ async def _handle_queued_command(cmd: str, arg: str, user_id: str) -> str:
         last = _last_results.get(user_id)
         return commands.format_status(last, session_id, config.CLAUDE_MODEL)
     elif cmd == "/update":
+        if not config.is_primary(sender_id):
+            return "仅主用户可执行 /update"
         return await commands.run_update()
     elif cmd == "/help":
         return commands.format_help()
@@ -394,33 +623,54 @@ async def _poll_loop(token: str, base_url: str) -> None:
             if msg.get("message_type") != 1:
                 continue
 
-            # Permission check
+            # Extract text once for all checks below
             user_id = msg.get("from_user_id", "")
-            if user_id not in config.ALLOWED_USERS:
-                log.info("Blocked message from non-allowed user: %s", user_id[:16])
-                continue
+            group_id = _detect_group(msg)
+            text = _extract_text(msg)
+
+            if group_id:
+                # Group message: check group policy
+                if not _is_group_allowed(group_id):
+                    continue
+
+                # @mention filter: only respond when bot specifically mentioned
+                if config.GROUP_REQUIRE_MENTION:
+                    if not _has_mention(msg, text):
+                        continue
+
+                # Strip @mention prefix so commands and prompts are clean
+                if text:
+                    text = _strip_mention(text)
+
+                # Group messages use group_id as queue key (shared session per group)
+                chat_id = group_id
+            else:
+                # DM: permission check on sender
+                if user_id not in config.ALLOWED_USERS:
+                    log.info("Blocked message from non-allowed user: %s", user_id[:16])
+                    continue
+                chat_id = user_id
 
             # Immediate commands (/stop, /new) bypass the queue
-            text = _extract_text(msg)
             if text:
                 parsed = commands.parse_command(text)
                 if parsed and parsed[0] in ("/stop", "/new"):
                     # Update context token even for immediate commands
                     ctx_tok = msg.get("context_token", "")
                     if ctx_tok:
-                        _ctx_store.update(user_id, ctx_tok)
+                        _ctx_store.update(chat_id, ctx_tok)
                     await _handle_immediate_command(
-                        parsed[0], user_id, token, base_url,
+                        parsed[0], chat_id, token, base_url,
                     )
                     continue
 
-            # Dispatch to per-user queue
-            if user_id not in _user_queues:
-                _user_queues[user_id] = asyncio.Queue()
-                _user_tasks[user_id] = asyncio.create_task(
-                    _user_worker(user_id, token, base_url)
+            # Dispatch to per-chat queue (user_id for DM, group_id for group)
+            if chat_id not in _user_queues:
+                _user_queues[chat_id] = asyncio.Queue()
+                _user_tasks[chat_id] = asyncio.create_task(
+                    _user_worker(chat_id, token, base_url)
                 )
-            await _user_queues[user_id].put(msg)
+            await _user_queues[chat_id].put(msg)
 
 
 async def _handle_immediate_command(
@@ -538,6 +788,15 @@ async def _session_recovery(base_url: str) -> tuple[str, str] | None:
                     log.info("Session recovery complete, new token obtained")
                     return new_creds["bot_token"], new_creds["base_url"]
 
+                elif status == "scaned_but_redirect":
+                    new_host = status_resp.get("redirect_host", "")
+                    if new_host:
+                        if new_host.startswith("http://"):
+                            log.error("QR redirect rejected: HTTP not allowed (got %s)", new_host)
+                            return None
+                        base_url = new_host if new_host.startswith("https://") else f"https://{new_host}"
+                        log.info("QR login redirect to %s", base_url)
+
                 elif status == "scaned":
                     log.info("QR scanned, waiting for confirmation...")
 
@@ -630,7 +889,7 @@ async def _flush_state() -> None:
 
 async def run_bridge() -> None:
     """Main entry point."""
-    global _http, _dedup, _ctx_store, _session_map, _semaphore
+    global _http, _dedup, _ctx_store, _session_map, _semaphore, _bot_id
 
     # Init config
     config.init()
@@ -645,6 +904,12 @@ async def run_bridge() -> None:
 
     token = creds["bot_token"]
     base_url = creds["base_url"]
+    _bot_id = creds.get("bot_id", "") or creds.get("user_id", "")
+
+    # Acquire exclusive lock (prevent multi-instance token conflicts)
+    _lock = lockfile.BridgeLock(config.STATE_DIR)
+    if not _lock.acquire():
+        sys.exit(1)
 
     # Init state
     _dedup = MessageDedup()
@@ -681,4 +946,5 @@ async def run_bridge() -> None:
 
         await _flush_state()
         await _http.close()
+        _lock.release()
         log.info("wechat-bridge stopped")

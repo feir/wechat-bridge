@@ -229,3 +229,61 @@ def build_text_message(
             }
         ],
     }
+
+
+def build_image_message(
+    user_id: str,
+    context_token: str,
+    upload_info: dict[str, Any],
+) -> SendMessageBody:
+    """Build an image reply message from CDN upload metadata."""
+    return {
+        "from_user_id": "",
+        "to_user_id": user_id,
+        "client_id": str(uuid4()),
+        "message_type": MessageType.BOT,
+        "message_state": MessageState.FINISH,
+        "context_token": context_token,
+        "item_list": [
+            {
+                "type": MessageItemType.IMAGE,
+                "image_item": {
+                    "media": {
+                        "encrypt_query_param": upload_info.get("encrypt_query_param", ""),
+                        "aes_key": upload_info.get("aes_key", ""),
+                        "encrypt_type": upload_info.get("encrypt_type", 1),
+                    },
+                },
+            }
+        ],
+    }
+
+
+def build_file_message(
+    user_id: str,
+    context_token: str,
+    upload_info: dict[str, Any],
+    file_name: str,
+) -> SendMessageBody:
+    """Build a file reply message from CDN upload metadata."""
+    return {
+        "from_user_id": "",
+        "to_user_id": user_id,
+        "client_id": str(uuid4()),
+        "message_type": MessageType.BOT,
+        "message_state": MessageState.FINISH,
+        "context_token": context_token,
+        "item_list": [
+            {
+                "type": MessageItemType.FILE,
+                "file_item": {
+                    "media": {
+                        "encrypt_query_param": upload_info.get("encrypt_query_param", ""),
+                        "aes_key": upload_info.get("aes_key", ""),
+                        "encrypt_type": upload_info.get("encrypt_type", 1),
+                    },
+                    "file_name": file_name,
+                },
+            }
+        ],
+    }

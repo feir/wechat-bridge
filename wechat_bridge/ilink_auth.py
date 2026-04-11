@@ -113,6 +113,17 @@ async def login(
                 pass  # still waiting
             elif status == "scaned":
                 print("  QR scanned! Waiting for confirmation...")
+            elif status == "scaned_but_redirect":
+                # iLink backend migration: switch to new host and re-poll
+                new_host = status_resp.get("redirect_host", "")
+                if new_host:
+                    if new_host.startswith("http://"):
+                        log.error("QR redirect rejected: HTTP not allowed (got %s)", new_host)
+                        print("  Error: redirect host uses HTTP, HTTPS required.")
+                        sys.exit(1)
+                    base_url = new_host if new_host.startswith("https://") else f"https://{new_host}"
+                    print(f"  Redirected to {base_url}, continuing...")
+                    log.info("QR login redirect to %s", base_url)
             elif status == "confirmed":
                 creds = {
                     "bot_token": status_resp["bot_token"],

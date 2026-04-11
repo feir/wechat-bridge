@@ -30,6 +30,12 @@ FEISHU_NOTIFY_CHAT_ID: str = ""
 SYSTEM_PROMPT: str = ""
 CREDENTIALS_FILE: Path = Path.home() / ".config" / "wechat-bridge" / "credentials.json"
 
+# --- Group chat ---
+# Policy: "disabled" (ignore all), "open" (respond to all), "allowlist" (only listed groups)
+GROUP_POLICY: str = "disabled"
+ALLOWED_GROUPS: set[str] = set()  # group IDs for allowlist mode
+GROUP_REQUIRE_MENTION: bool = True  # only respond when @mentioned in group (recommended)
+
 # Tools blocked for non-primary users (filesystem write + shell access)
 GUEST_DISALLOWED_TOOLS: list[str] = [
     "Bash", "Write", "Edit", "NotebookEdit",
@@ -47,7 +53,7 @@ def init() -> None:
     """Load config from environment. Call once at startup."""
     global ALLOWED_USERS, PRIMARY_USER, CLAUDE_MODEL, CLAUDE_TIMEOUT, MAX_CONCURRENT
     global STATE_DIR, FEISHU_NOTIFY_CHAT_ID, SYSTEM_PROMPT, MAX_BUDGET_USD, GUEST_MAX_BUDGET_USD
-    global CREDENTIALS_FILE
+    global CREDENTIALS_FILE, GROUP_POLICY, ALLOWED_GROUPS, GROUP_REQUIRE_MENTION
 
     raw = _require("WECHAT_ALLOWED_USERS")
     _users_ordered = [u.strip() for u in raw.split(",") if u.strip()]
@@ -90,6 +96,16 @@ def init() -> None:
             SYSTEM_PROMPT = _DEFAULT_SYSTEM_PROMPT
     else:
         SYSTEM_PROMPT = os.environ.get("WECHAT_SYSTEM_PROMPT", "").strip() or _DEFAULT_SYSTEM_PROMPT
+
+    # Group chat config
+    GROUP_POLICY = os.environ.get("WECHAT_GROUP_POLICY", "disabled").strip().lower()
+    if GROUP_POLICY not in ("disabled", "open", "allowlist"):
+        print(f"WARNING: Invalid WECHAT_GROUP_POLICY={GROUP_POLICY}, using 'disabled'",
+              file=sys.stderr)
+        GROUP_POLICY = "disabled"
+    raw_groups = os.environ.get("WECHAT_ALLOWED_GROUPS", "").strip()
+    ALLOWED_GROUPS = {g.strip() for g in raw_groups.split(",") if g.strip()} if raw_groups else set()
+    GROUP_REQUIRE_MENTION = os.environ.get("WECHAT_GROUP_REQUIRE_MENTION", "true").strip().lower() != "false"
 
 
 def is_primary(user_id: str) -> bool:

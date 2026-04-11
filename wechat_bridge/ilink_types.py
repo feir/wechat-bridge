@@ -92,6 +92,11 @@ class WeixinMessage(TypedDict):
     message_state: MessageState
     context_token: str
     item_list: list[MessageItem]
+    # Group chat fields (present when message is from a group)
+    room_id: NotRequired[str]
+    chat_room_id: NotRequired[str]
+    # @mention list (some iLink versions)
+    at_user_list: NotRequired[list[str]]
 
 
 # --- API request/response ---
@@ -129,8 +134,9 @@ class QrCodeResponse(TypedDict):
 
 
 class QrStatusResponse(TypedDict):
-    status: Literal["wait", "scaned", "confirmed", "expired"]
+    status: Literal["wait", "scaned", "scaned_but_redirect", "confirmed", "expired"]
     bot_token: NotRequired[str]
     ilink_bot_id: NotRequired[str]
     ilink_user_id: NotRequired[str]
     baseurl: NotRequired[str]
+    redirect_host: NotRequired[str]  # new base URL when status=scaned_but_redirect
