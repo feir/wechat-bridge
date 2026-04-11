@@ -69,7 +69,7 @@ def get_update_banner() -> Optional[str]:
     pv = get_pending_version()
     if not pv:
         return None
-    return f"⬆ v{pv} 已就绪，重启服务部署"
+    return f"⬆ v{pv} 已就绪，/restart 部署"
 
 
 def check_and_update() -> dict:

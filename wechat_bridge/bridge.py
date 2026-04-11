@@ -9,11 +9,14 @@ Concurrency model:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re as _re
 import shutil
 import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -651,16 +654,16 @@ async def _poll_loop(token: str, base_url: str) -> None:
                     continue
                 chat_id = user_id
 
-            # Immediate commands (/stop, /new) bypass the queue
+            # Immediate commands (/stop, /new, /restart) bypass the queue
             if text:
                 parsed = commands.parse_command(text)
-                if parsed and parsed[0] in ("/stop", "/new"):
+                if parsed and parsed[0] in ("/stop", "/new", "/restart"):
                     # Update context token even for immediate commands
                     ctx_tok = msg.get("context_token", "")
                     if ctx_tok:
                         _ctx_store.update(chat_id, ctx_tok)
                     await _handle_immediate_command(
-                        parsed[0], chat_id, token, base_url,
+                        parsed[0], chat_id, user_id, token, base_url,
                     )
                     continue
 
@@ -674,12 +677,13 @@ async def _poll_loop(token: str, base_url: str) -> None:
 
 
 async def _handle_immediate_command(
-    cmd: str, user_id: str, token: str, base_url: str,
+    cmd: str, user_id: str, sender_id: str, token: str, base_url: str,
 ) -> None:
-    """Handle commands that bypass the queue (/stop, /new).
+    """Handle commands that bypass the queue (/stop, /new, /restart).
 
     These must be processed immediately — if they were queued, they'd
     block behind the very Claude invocation the user wants to cancel.
+    sender_id is the actual human who sent the command (differs from user_id in groups).
     """
     if cmd == "/stop":
         task = _user_tasks.get(user_id)
@@ -719,6 +723,27 @@ async def _handle_immediate_command(
             timer.cancel()
         log.info("Session reset via /new: %s", user_id[:16])
         await _send_reply(user_id, token, base_url, "会话已重置，开始新对话")
+
+    elif cmd == "/restart":
+        if not config.is_primary(sender_id):
+            await _send_reply(user_id, token, base_url, "仅主用户可执行 /restart")
+            return
+        log.info("Restart requested by user %s in chat %s",
+                 sender_id[:16], user_id[:16])
+        from wechat_bridge import __version__
+        await _send_reply(user_id, token, base_url, f"正在重启 v{__version__}...")
+        # Persist chat_id so the new process can send restart-complete notification
+        restart_file = config.STATE_DIR / "restart.json"
+        try:
+            restart_file.write_text(json.dumps({"chat_id": user_id}))
+        except Exception:
+            log.exception("Failed to write restart state")
+        await _flush_state()
+        # Non-zero exit triggers Restart=on-failure in systemd
+        def _deferred_exit():
+            logging.shutdown()
+            os._exit(1)
+        threading.Timer(0.3, _deferred_exit).start()
 
 
 _RECOVERY_MAX_ERRORS = 10  # Max consecutive non-transient errors before giving up
@@ -885,6 +910,27 @@ async def _flush_state() -> None:
     log.info("State flushed to disk")
 
 
+async def _notify_restart_complete(token: str, base_url: str) -> None:
+    """Send restart-complete message if a /restart was in progress."""
+    restart_file = config.STATE_DIR / "restart.json"
+    if not restart_file.exists():
+        return
+    try:
+        data = json.loads(restart_file.read_text())
+        chat_id = data.get("chat_id")
+        if chat_id:
+            from wechat_bridge import __version__
+            await _send_reply(chat_id, token, base_url, f"重启完成 v{__version__}")
+            log.info("Restart-complete notification sent to %s", chat_id[:16])
+    except Exception:
+        log.warning("Failed to send restart-complete notification", exc_info=True)
+    finally:
+        try:
+            restart_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 # --- Entry point ---
 
 async def run_bridge() -> None:
@@ -930,6 +976,10 @@ async def run_bridge() -> None:
     # Run
     log.info("wechat-bridge starting (base_url=%s)", base_url)
     _http = aiohttp.ClientSession()
+
+    # Notify restart-complete if a /restart was in progress
+    await _notify_restart_complete(token, base_url)
+
     try:
         await _poll_loop(token, base_url)
     finally:

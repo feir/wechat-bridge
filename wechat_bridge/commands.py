@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 # --- Command detection ---
 
-_COMMANDS = frozenset({"/new", "/stop", "/compact", "/status", "/update", "/help"})
+_COMMANDS = frozenset({"/new", "/stop", "/compact", "/status", "/update", "/restart", "/help"})
 
 
 def parse_command(text: str) -> tuple[str, str] | None:
@@ -42,6 +42,7 @@ def format_help() -> str:
         "/compact — 压缩上下文\n"
         "/status — 查看会话状态\n"
         "/update — 检查并拉取新版本\n"
+        "/restart — 重启服务（部署新版本）\n"
         "/help — 显示此帮助"
     )
 
@@ -123,7 +124,7 @@ async def run_update() -> str:
 
     pv = updater.get_pending_version()
     if pv:
-        return f"v{pv} 已就绪（当前运行 v{__version__}），重启服务部署。"
+        return f"v{pv} 已就绪（当前运行 v{__version__}），/restart 部署。"
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, updater.check_and_update)
@@ -131,7 +132,7 @@ async def run_update() -> str:
     if status == "updated":
         return (
             f"已拉取新版本 v{result['version']}"
-            f"（当前运行 v{__version__}），重启服务部署。"
+            f"（当前运行 v{__version__}），/restart 部署。"
         )
     elif status == "up_to_date":
         return f"已是最新版本 v{__version__}。"
